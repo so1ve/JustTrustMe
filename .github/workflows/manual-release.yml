@@ -1,0 +1,84 @@
+name: Manual Build and Release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Build release APK from source
+        run: ./gradlew assembleRelease
+
+      - name: Sign APK (repo certificate or temporary certificate)
+        id: sign
+        env:
+          KEYSTORE_B64: ${{ secrets.SIGNING_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.SIGNING_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          UNSIGNED_APK=$(ls -1 app/build/outputs/apk/release/*-unsigned.apk | head -n 1)
+          SIGNED_APK="${UNSIGNED_APK%-unsigned.apk}-signed.apk"
+
+          if [[ -n "${KEYSTORE_B64:-}" && -n "${KEYSTORE_PASSWORD:-}" && -n "${KEY_ALIAS:-}" && -n "${KEY_PASSWORD:-}" ]]; then
+            echo "$KEYSTORE_B64" | base64 --decode > signing.keystore
+            echo "Using repository signing certificate from secrets."
+          else
+            echo "No signing secrets found, generating temporary certificate for this build."
+            keytool -genkeypair \
+              -keystore signing.keystore \
+              -storepass temp-password \
+              -keypass temp-password \
+              -alias temp-alias \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 3650 \
+              -dname "CN=JustTrustMe CI, OU=CI, O=JustTrustMe, L=NA, ST=NA, C=US"
+            KEYSTORE_PASSWORD="temp-password"
+            KEY_ALIAS="temp-alias"
+            KEY_PASSWORD="temp-password"
+          fi
+
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner | sort | tail -n 1)
+          "$APKSIGNER" sign \
+            --ks signing.keystore \
+            --ks-pass pass:"$KEYSTORE_PASSWORD" \
+            --ks-key-alias "$KEY_ALIAS" \
+            --key-pass pass:"$KEY_PASSWORD" \
+            --out "$SIGNED_APK" \
+            "$UNSIGNED_APK"
+
+          "$APKSIGNER" verify "$SIGNED_APK"
+          echo "signed_apk=$SIGNED_APK" >> "$GITHUB_OUTPUT"
+
+      - name: Generate release metadata (date + timestamp)
+        id: meta
+        run: |
+          TS=$(date -u +"%Y%m%d-%H%M%S")
+          echo "tag=release-${TS}" >> "$GITHUB_OUTPUT"
+          echo "name=Release ${TS}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release and upload APK
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.name }}
+          generate_release_notes: true
+          files: ${{ steps.sign.outputs.signed_apk }}
